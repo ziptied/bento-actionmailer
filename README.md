@@ -50,7 +50,7 @@ Add the gem to your application's Gemfile:
 gem 'bento-actionmailer', github: 'bentonow/bento-actionmailer', branch: 'main'
 ```
 
-If you are a Rails app, we also *strongly* recommend using `premailer-rails` to inline all your CSS and ensure there is both an HTML and text version for every email.
+If you are a Rails app, we also *strongly* recommend using `premailer-rails` to inline all your CSS and ensure there is both an HTML and text version for every email. This is also a requirement from for all Rails 8.X apps. 
 
 ```ruby
 gem 'premailer-rails'
