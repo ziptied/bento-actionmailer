@@ -50,7 +50,7 @@ module MailFixtures
   end
 
   def large_html_mail(size: 50_000)
-    html = "<div>#{'A' * size}</div>"
+    html = "<div>#{"A" * size}</div>"
     html_only_mail(subject: "Large HTML", to: DEFAULT_TO, from: DEFAULT_FROM).tap do |mail|
       mail.html_part.body = html
     end
