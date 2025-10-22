@@ -6,6 +6,7 @@ require "bento_actionmailer/railtie" if defined? Rails
 require "net/http"
 require "uri"
 require "json"
+require "openssl"
 
 module BentoActionMailer
   class DeliveryMethod
@@ -31,25 +32,71 @@ module BentoActionMailer
     attr_accessor :settings
 
     def initialize(params = {})
-      self.settings = DEFAULTS.merge(params)
+      self.settings = DEFAULTS.merge(normalize_settings(params))
     end
 
     def deliver!(mail)
-      html_body = mail.body.parts.find { |p| p.content_type =~ /text\/html/ }
-      raise DeliveryError, "No HTML body given. Bento requires an html email body." unless html_body
+      message = ensure_mail!(mail)
+      html_body = extract_html_body(message)
 
       send_mail(
-        to: mail.to.first,
-        from: mail.from.first,
-        subject: mail.subject,
-        html_body: html_body.decoded,
+        to: extract_address(message.to, :to),
+        from: extract_address(message.from, :from),
+        subject: extract_subject(message.subject),
+        html_body: html_body,
         personalization: {}
       )
     end
 
     private
 
+    def normalize_settings(params)
+      return {} if params.nil?
+      raise TypeError, "Settings must be provided as a hash-like object" unless params.respond_to?(:to_hash)
+
+      params.to_hash
+    end
+
+    def ensure_mail!(mail)
+      raise DeliveryError, "Mail message is required" unless mail&.respond_to?(:body)
+
+      mail
+    end
+
+    def extract_html_body(mail)
+      html_part = Array(mail.body&.parts).find { |part| part.content_type =~ %r{text/html} }
+      raise DeliveryError, "No HTML body given. Bento requires an html email body." unless html_part
+
+      html_part.decoded
+    end
+
+    def extract_address(addresses, field_name)
+      value = Array(addresses).compact.map { |address| address.to_s.strip }.find { |address| !address.empty? }
+      raise DeliveryError, "Mail #{field_name} address is required" unless value
+
+      value
+    end
+
+    def extract_subject(subject)
+      value = subject.to_s.strip
+      raise DeliveryError, "Mail subject is required" if value.empty?
+
+      subject.to_s
+    end
+
+    def require_setting(key)
+      value = settings[key] || settings[key.to_s]
+      value = value.to_s.strip if value
+      raise DeliveryError, "Delivery setting #{key} is required" if value.nil? || value.empty?
+
+      value
+    end
+
     def send_mail(to:, from:, subject:, html_body:, personalization: {})
+      site_uuid = require_setting(:site_uuid)
+      publishable_key = require_setting(:publishable_key)
+      secret_key = require_setting(:secret_key)
+
       import_data = [
         {
           to: to,
@@ -62,8 +109,8 @@ module BentoActionMailer
       ]
 
       request = Net::HTTP::Post.new(BENTO_ENDPOINT)
-      request.basic_auth(settings[:publishable_key], settings[:secret_key])
-      request.body = JSON.dump({ site_uuid: settings[:site_uuid], emails: import_data })
+      request.basic_auth(publishable_key, secret_key)
+      request.body = JSON.dump({ site_uuid: site_uuid, emails: import_data })
       request.content_type = "application/json"
       req_options = { use_ssl: BENTO_ENDPOINT.scheme == "https" }
 
@@ -72,6 +119,8 @@ module BentoActionMailer
       end
 
       handle_response(response)
+    rescue Timeout::Error, Errno::ECONNREFUSED, SocketError, OpenSSL::SSL::SSLError => error
+      raise build_delivery_error("Network error: #{error.message}", nil, { "exception" => error.class.name })
     end
 
     def handle_response(response)
