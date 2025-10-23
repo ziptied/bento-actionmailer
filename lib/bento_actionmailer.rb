@@ -14,6 +14,7 @@ require "net/http"
 require "uri"
 require "json"
 require "openssl"
+require "cgi"
 
 module BentoActionMailer
   class DeliveryMethod
@@ -71,9 +72,15 @@ module BentoActionMailer
     def extract_html_body(mail)
       extractor = MessageExtractor.new(mail)
       html_body = extractor.html_body
-      raise DeliveryError, "No HTML body given. Bento requires an html email body." unless html_body
+      return inline_html(html_body) if html_body
 
-      inline_html(html_body)
+      text_body = extractor.text_body
+      if text_body
+        generated_html = build_html_from_text(text_body)
+        return inline_html(generated_html)
+      end
+
+      raise DeliveryError, "No HTML body given. Bento requires an html email body."
     end
 
     def extract_text_body(mail)
@@ -199,6 +206,16 @@ module BentoActionMailer
 
     def build_delivery_error(message, status, error_data)
       DeliveryError.new(message, response_code: status, error_details: error_data)
+    end
+
+    def build_html_from_text(text_body)
+      sanitized = CGI.escapeHTML(text_body.to_s)
+      paragraphs = sanitized.split(/\n{2,}/).map do |block|
+        "<p>#{block.gsub("\n", "<br>")}</p>"
+      end
+
+      body = paragraphs.empty? ? "<p>#{sanitized.gsub("\n", "<br>")}</p>" : paragraphs.join
+      "<div class=\"bento-text-only\">#{body}</div>"
     end
 
     def inline_html(html)

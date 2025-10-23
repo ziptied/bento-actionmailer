@@ -147,17 +147,18 @@ class NotificationMailer < ApplicationMailer
 end
 ```
 
-When only one format is present, the API payload omits the missing body.
+When only one format is present, the API payload omits the missing body. If your mailer only renders a text part, Bento Action Mailer now generates a sanitized HTML wrapper on your behalf (Bento requires HTML in every request). Supplying only HTML still works as before—we do not auto-generate a plain text fragment.
 
 ## Things to Know
 
 1. **CSS inlining** is available automatically for Rails 7.0+ projects. If the inliner encounters an error, the original HTML is delivered unchanged.
 2. **Dual format delivery** forwards both HTML and plain text bodies when your mailer renders them.
-3. **Rails 6.x and earlier** continue to work without CSS inlining or additional configuration.
-4. **BCC** delivery is not available in the current release.
-5. **Attachments** are not supported yet.
-6. **Custom email headers** are not supported at the moment.
-7. For complex email setups, consider reaching out to the Bento team for support or contributing to the project.
+3. **Text-only fallback**: Supplying only a text body is allowed. The adapter escapes and wraps the text in minimal HTML so Bento accepts the payload. We do **not** generate text from HTML; include your own text variant if you want a multipart email.
+4. **Rails 6.x and earlier** continue to work without CSS inlining or additional configuration.
+5. **BCC** delivery is not available in the current release.
+6. **Attachments** are not supported yet.
+7. **Custom email headers** are not supported at the moment.
+8. For complex email setups, consider reaching out to the Bento team for support or contributing to the project.
 
 ## Contributing
 

@@ -96,14 +96,16 @@ class DeliveryMethodDeliverTest < Minitest::Test
     end
   end
 
-  def test_deliver_raises_when_html_body_missing
+  def test_deliver_generates_html_from_text_when_html_missing
     mail = build_text_only_mail
-
-    error = assert_raises(BentoActionMailer::DeliveryMethod::DeliveryError) do
+    captured = nil
+    @delivery_method.stub(:send_mail, ->(payload, **_options) { captured = payload }) do
       @delivery_method.deliver!(mail)
     end
 
-    assert_equal "No HTML body given. Bento requires an html email body.", error.message
+    assert_equal "Hello", captured[:text_body]
+    assert_includes captured[:html_body], "<div class=\"bento-text-only\">"
+    assert_includes captured[:html_body], "<p>Hello</p>"
   end
 
   def test_deliver_raises_when_mail_is_nil
@@ -154,6 +156,18 @@ class DeliveryMethodDeliverTest < Minitest::Test
 
     error = assert_raises(BentoActionMailer::DeliveryMethod::DeliveryError) { @delivery_method.deliver!(mail) }
     assert_equal "No HTML body given. Bento requires an html email body.", error.message
+  end
+
+  def test_deliver_text_only_preserves_newlines_in_generated_html
+    mail = build_text_only_mail(text_body: "Line one\nLine two\n\nLine four")
+    captured = nil
+    @delivery_method.stub(:send_mail, ->(payload, **_options) { captured = payload }) do
+      @delivery_method.deliver!(mail)
+    end
+
+    html = captured[:html_body]
+    assert_includes html, "<p>Line one<br>Line two</p>"
+    assert_includes html, "<p>Line four</p>"
   end
 
   def test_deliver_handles_uppercase_html_content_type
