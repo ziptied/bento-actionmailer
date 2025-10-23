@@ -2,6 +2,13 @@
 
 require "bento_actionmailer/version"
 require "bento_actionmailer/railtie" if defined? Rails
+require "bento_actionmailer/support/rails_version"
+require "bento_actionmailer/pipeline"
+require "bento_actionmailer/actions"
+require "bento_actionmailer/premailer_inliner"
+require "bento_actionmailer/message_extractor"
+require "bento_actionmailer/delivery_pipeline_factory"
+require "bento_actionmailer/premailer_support"
 
 require "net/http"
 require "uri"
@@ -10,6 +17,7 @@ require "openssl"
 
 module BentoActionMailer
   class DeliveryMethod
+    include PremailerSupport
     class DeliveryError < StandardError
       attr_reader :response_code, :error_details
 
@@ -36,16 +44,13 @@ module BentoActionMailer
     end
 
     def deliver!(mail)
-      message = ensure_mail!(mail)
-      html_body = extract_html_body(message)
-
-      send_mail(
-        to: extract_address(message.to, :to),
-        from: extract_address(message.from, :from),
-        subject: extract_subject(message.subject),
-        html_body: html_body,
+      context = {
+        mail: mail,
         personalization: {}
-      )
+      }
+
+      pipeline = DeliveryPipelineFactory.new(self).build
+      pipeline.call(context)[:result]
     end
 
     private
@@ -64,10 +69,15 @@ module BentoActionMailer
     end
 
     def extract_html_body(mail)
-      html_part = Array(mail.body&.parts).find { |part| part.content_type =~ %r{text/html} }
-      raise DeliveryError, "No HTML body given. Bento requires an html email body." unless html_part
+      extractor = MessageExtractor.new(mail)
+      html_body = extractor.html_body
+      raise DeliveryError, "No HTML body given. Bento requires an html email body." unless html_body
 
-      html_part.decoded
+      inline_html(html_body)
+    end
+
+    def extract_text_body(mail)
+      MessageExtractor.new(mail).text_body
     end
 
     def extract_address(addresses, field_name)
@@ -92,10 +102,26 @@ module BentoActionMailer
       value
     end
 
-    def send_mail(to:, from:, subject:, html_body:, personalization: {})
+    def delivery_actions
+      [
+        Actions::EnsureMail.new(self),
+        Actions::ExtractAddresses.new(self),
+        Actions::ExtractSubject.new(self),
+        Actions::ExtractBodies.new(self),
+        Actions::DispatchEmail.new(self)
+      ]
+    end
+
+    def send_mail(mail_payload, personalization: {})
       site_uuid = require_setting(:site_uuid)
       publishable_key = require_setting(:publishable_key)
       secret_key = require_setting(:secret_key)
+
+      to = mail_payload.fetch(:to)
+      from = mail_payload.fetch(:from)
+      subject = mail_payload.fetch(:subject)
+      html_body = mail_payload.fetch(:html_body)
+      text_body = mail_payload[:text_body]
 
       import_data = [
         {
@@ -103,6 +129,7 @@ module BentoActionMailer
           from: from,
           subject: subject,
           html_body: html_body,
+          text_body: text_body,
           transactional: settings[:transactional],
           personalizations: personalization
         }
@@ -172,6 +199,12 @@ module BentoActionMailer
 
     def build_delivery_error(message, status, error_data)
       DeliveryError.new(message, response_code: status, error_details: error_data)
+    end
+
+    def inline_html(html)
+      return html unless rails_7_or_higher?
+
+      premailer_inliner.inline(html)
     end
   end
 end

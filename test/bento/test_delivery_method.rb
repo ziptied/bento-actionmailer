@@ -59,6 +59,7 @@ end
 class DeliveryMethodDeliverTest < Minitest::Test
   def setup
     @delivery_method = build_delivery_method
+    reset_premailer_inliner(@delivery_method)
   end
 
   def test_deliver_with_multipart_mail_extracts_html_and_invokes_send_mail
@@ -71,7 +72,9 @@ class DeliveryMethodDeliverTest < Minitest::Test
     )
 
     captured_arguments = nil
-    @delivery_method.stub(:send_mail, ->(**params) { captured_arguments = params }) do
+    @delivery_method.stub(:send_mail, lambda do |payload, **options|
+      captured_arguments = payload.merge(options)
+    end) do
       @delivery_method.deliver!(mail)
     end
 
@@ -79,15 +82,17 @@ class DeliveryMethodDeliverTest < Minitest::Test
     assert_equal "sender@example.com", captured_arguments[:from]
     assert_equal "Welcome", captured_arguments[:subject]
     assert_equal "<p>Hi there</p>", captured_arguments[:html_body]
+    assert_equal "Hi there", captured_arguments[:text_body]
     assert_equal({}, captured_arguments[:personalization])
   end
 
   def test_deliver_supports_html_only_messages
     mail = build_mail_message(text_body: nil, html_body: "<section>Only HTML</section>")
 
-    @delivery_method.stub(:send_mail, ->(**params) { params[:html_body] }) do
+    @delivery_method.stub(:send_mail, ->(payload, **options) { payload.merge(options) }) do
       result = @delivery_method.deliver!(mail)
-      assert_equal "<section>Only HTML</section>", result
+      assert_equal "<section>Only HTML</section>", result[:html_body]
+      assert_nil result[:text_body]
     end
   end
 
@@ -164,7 +169,7 @@ class DeliveryMethodDeliverTest < Minitest::Test
       parts: [html_part]
     )
 
-    @delivery_method.stub(:send_mail, ->(**params) { params[:html_body] }) do
+    @delivery_method.stub(:send_mail, ->(payload, **_options) { payload[:html_body] }) do
       assert_equal "<p>Hi</p>", @delivery_method.deliver!(mail)
     end
   end
@@ -173,7 +178,7 @@ class DeliveryMethodDeliverTest < Minitest::Test
     large_html = "<p>#{"A" * 50_000}</p>"
     mail = build_mail_message(html_body: large_html, text_body: nil)
 
-    @delivery_method.stub(:send_mail, ->(**params) { params[:html_body].length }) do
+    @delivery_method.stub(:send_mail, ->(payload, **_options) { payload[:html_body].length }) do
       assert_equal large_html.length, @delivery_method.deliver!(mail)
     end
   end
@@ -186,7 +191,7 @@ class DeliveryMethodDeliverTest < Minitest::Test
       html_body: "<p>Hi</p>"
     )
 
-    @delivery_method.stub(:send_mail, ->(**params) { params[:to] }) do
+    @delivery_method.stub(:send_mail, ->(payload, **_options) { payload[:to] }) do
       assert_equal "first@example.com", @delivery_method.deliver!(mail)
     end
   end
@@ -199,9 +204,9 @@ class DeliveryMethodDeliverTest < Minitest::Test
       html_body: "<p>Hi</p>"
     )
 
-    @delivery_method.stub(:send_mail, ->(**params) { [params[:to], params[:from]] }) do
+    @delivery_method.stub(:send_mail, ->(payload, **_options) { [payload[:to], payload[:from], payload[:text_body]] }) do
       result = @delivery_method.deliver!(mail)
-      assert_equal ["spaced@example.com", "sender@example.com"], result
+      assert_equal ["spaced@example.com", "sender@example.com", "Hello"], result
     end
   end
 
@@ -209,12 +214,75 @@ class DeliveryMethodDeliverTest < Minitest::Test
     mail = fixture_mail(:special_character_mail)
 
     captured = nil
-    @delivery_method.stub(:send_mail, ->(**params) { captured = params }) do
+    @delivery_method.stub(:send_mail, ->(payload, **_options) { captured = payload }) do
       @delivery_method.deliver!(mail)
     end
 
     assert_equal "Unicode ✓", captured[:subject]
     assert_equal "büyer+test@example.com", captured[:to]
+  end
+end
+
+class DeliveryMethodPremailerIntegrationTest < Minitest::Test
+  def setup
+    @delivery_method = build_delivery_method
+  end
+
+  def teardown
+    reset_premailer_inliner(@delivery_method)
+  end
+
+  def test_inlines_css_for_rails_seven_and_above
+    with_stubbed_rails(version: "7.1.0") do
+      html = <<~HTML
+        <html>
+          <head>
+            <style>
+              .highlight { color: red; }
+            </style>
+          </head>
+          <body>
+            <p class="highlight">Styled</p>
+          </body>
+        </html>
+      HTML
+
+      assert @delivery_method.send(:rails_7_or_higher?)
+      result = @delivery_method.send(:inline_html, html)
+
+      assert_includes result, "style=\"color: red;\""
+      assert_includes result, "Styled"
+    end
+  end
+
+  def test_skips_inlining_for_older_rails_versions
+    with_stubbed_rails(version: "6.1.0") do
+      html = "<p class=\"highlight\">Plain</p>"
+
+      refute @delivery_method.send(:rails_7_or_higher?)
+      result = @delivery_method.send(:inline_html, html)
+
+      assert_equal html, result
+    end
+  end
+
+  def test_falls_back_to_original_html_when_inliner_raises
+    with_stubbed_rails(version: "7.1.0") do
+      html = "<p>Fallback</p>"
+
+      @delivery_method.send(:ensure_premailer_loaded!)
+      ::Premailer.stub(:new, ->(*_) { raise StandardError, "inline failure" }) do
+        result = @delivery_method.send(:inline_html, html)
+
+        assert_equal html, result
+      end
+    end
+  end
+
+  def test_extract_text_body_returns_plain_text_segment
+    mail = build_mail_message(html_body: "<p>HTML</p>", text_body: "Plain text")
+    text = @delivery_method.send(:extract_text_body, mail)
+    assert_equal "Plain text", text
   end
 end
 
@@ -232,12 +300,17 @@ class DeliveryMethodSendMailTest < Minitest::Test
         captured[:handled] = res
         :handled
       }) do
-        result = @delivery_method.send(
-          :send_mail,
+        payload = {
           to: "user@example.com",
           from: "sender@example.com",
           subject: "Welcome",
           html_body: "<p>Hello</p>",
+          text_body: "Hello"
+        }
+
+        result = @delivery_method.send(
+          :send_mail,
+          payload,
           personalization: { first_name: "Test" }
         )
         captured[:result] = result
@@ -256,6 +329,7 @@ class DeliveryMethodSendMailTest < Minitest::Test
     assert_equal "sender@example.com", email_payload[:from]
     assert_equal "Welcome", email_payload[:subject]
     assert_equal "<p>Hello</p>", email_payload[:html_body]
+    assert_equal "Hello", email_payload[:text_body]
     assert_equal true, email_payload[:transactional]
     assert_equal({ first_name: "Test" }, email_payload[:personalizations])
 
@@ -270,14 +344,15 @@ class DeliveryMethodSendMailTest < Minitest::Test
   def test_send_mail_requires_credentials
     delivery_method = build_delivery_method(publishable_key: " ", secret_key: nil)
 
+    payload = {
+      to: "user@example.com",
+      from: "sender@example.com",
+      subject: "Welcome",
+      html_body: "<p>Hello</p>"
+    }
+
     error = assert_raises(BentoActionMailer::DeliveryMethod::DeliveryError) do
-      delivery_method.send(
-        :send_mail,
-        to: "user@example.com",
-        from: "sender@example.com",
-        subject: "Welcome",
-        html_body: "<p>Hello</p>"
-      )
+      delivery_method.send(:send_mail, payload)
     end
 
     assert_equal "Delivery setting publishable_key is required", error.message
@@ -287,14 +362,15 @@ class DeliveryMethodSendMailTest < Minitest::Test
     exception = Timeout::Error.new("execution expired")
 
     Net::HTTP.stub(:start, ->(*_) { raise exception }) do
+      payload = {
+        to: "user@example.com",
+        from: "sender@example.com",
+        subject: "Welcome",
+        html_body: "<p>Hello</p>"
+      }
+
       error = assert_raises(BentoActionMailer::DeliveryMethod::DeliveryError) do
-        @delivery_method.send(
-          :send_mail,
-          to: "user@example.com",
-          from: "sender@example.com",
-          subject: "Welcome",
-          html_body: "<p>Hello</p>"
-        )
+        @delivery_method.send(:send_mail, payload)
       end
 
       assert_equal "Network error: execution expired", error.message
@@ -307,14 +383,15 @@ class DeliveryMethodSendMailTest < Minitest::Test
     exception = SocketError.new("host unreachable")
 
     Net::HTTP.stub(:start, ->(*_) { raise exception }) do
+      payload = {
+        to: "user@example.com",
+        from: "sender@example.com",
+        subject: "Welcome",
+        html_body: "<p>Hello</p>"
+      }
+
       error = assert_raises(BentoActionMailer::DeliveryMethod::DeliveryError) do
-        @delivery_method.send(
-          :send_mail,
-          to: "user@example.com",
-          from: "sender@example.com",
-          subject: "Welcome",
-          html_body: "<p>Hello</p>"
-        )
+        @delivery_method.send(:send_mail, payload)
       end
 
       assert_equal "Network error: host unreachable", error.message
@@ -408,5 +485,84 @@ class DeliveryMethodUtilityTest < Minitest::Test
 
     assert_nil error.error_details
     assert_equal 500, error.response_code
+  end
+
+  def test_rails_7_or_higher_checks_support_module
+    with_stubbed_rails(version: "7.0.0") do
+      assert @delivery_method.send(:rails_7_or_higher?)
+    end
+  end
+
+  def test_ensure_premailer_loaded_is_noop_for_older_rails
+    with_stubbed_rails(version: "6.1.0") do
+      called = false
+
+      @delivery_method.stub(:require, ->(_) { called = true }) do
+        @delivery_method.send(:ensure_premailer_loaded!)
+      end
+
+      refute called
+    end
+  end
+
+  def test_ensure_premailer_loaded_skips_when_premailer_defined
+    with_stubbed_rails(version: "7.0.0") do
+      previously_defined = Object.const_defined?(:Premailer)
+      previous_premailer = Object.const_get(:Premailer) if previously_defined
+      Object.send(:remove_const, :Premailer) if previously_defined
+      Object.const_set(:Premailer, Module.new)
+
+      called = false
+      @delivery_method.stub(:require, ->(_) { called = true }) do
+        @delivery_method.send(:ensure_premailer_loaded!)
+      end
+
+      refute called
+    ensure
+      Object.send(:remove_const, :Premailer)
+      Object.const_set(:Premailer, previous_premailer) if previously_defined
+    end
+  end
+
+  def test_ensure_premailer_loaded_raises_helpful_error_when_missing
+    with_stubbed_rails(version: "7.0.0") do
+      load_error = LoadError.new("cannot load such file -- premailer-rails")
+
+      assert @delivery_method.send(:rails_7_or_higher?)
+      error = simulate_missing_premailer(load_error)
+
+      assert_match(/premailer-rails/, error.message)
+      assert_nil error.response_code
+      assert_equal(
+        {
+          "dependency" => "premailer-rails",
+          "original_error" => load_error.message
+        },
+        error.error_details
+      )
+    end
+  end
+
+  private
+
+  def simulate_missing_premailer(load_error)
+    existing_premailer = Object.const_get(:Premailer) if Object.const_defined?(:Premailer)
+    Object.send(:remove_const, :Premailer) if existing_premailer
+
+    begin
+      @delivery_method.singleton_class.class_eval do
+        define_method(:require) do |path|
+          raise load_error if path == "premailer/rails"
+          super(path)
+        end
+      end
+
+      assert_raises(BentoActionMailer::DeliveryMethod::DeliveryError) do
+        @delivery_method.send(:ensure_premailer_loaded!)
+      end
+    ensure
+      @delivery_method.singleton_class.send(:remove_method, :require)
+      Object.const_set(:Premailer, existing_premailer) if existing_premailer
+    end
   end
 end

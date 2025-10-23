@@ -84,5 +84,42 @@ module Bento
     def build_mail_stub(to:, from:, subject:, body:)
       Struct.new(:to, :from, :subject, :body).new(Array(to), Array(from), subject, body)
     end
+
+    def with_stubbed_rails(version: nil)
+      original_defined = Object.const_defined?(:Rails)
+      original_rails = Object.const_get(:Rails) if original_defined
+      Object.send(:remove_const, :Rails) if original_defined
+
+      stubbed = Module.new do
+        if version
+          gem_version = Gem::Version.new(version)
+          define_singleton_method(:gem_version) { gem_version }
+          define_singleton_method(:version) { version }
+        end
+
+        const_set(:Railtie, Class.new) unless const_defined?(:Railtie)
+      end
+
+      Object.const_set(:Rails, stubbed)
+      yield
+    ensure
+      Object.send(:remove_const, :Rails) if Object.const_defined?(:Rails)
+      Object.const_set(:Rails, original_rails) if original_defined
+    end
+
+    def without_rails
+      original_defined = Object.const_defined?(:Rails)
+      original_rails = Object.const_get(:Rails) if original_defined
+      Object.send(:remove_const, :Rails) if original_defined
+
+      yield
+    ensure
+      Object.const_set(:Rails, original_rails) if original_defined
+    end
+
+    def reset_premailer_inliner(delivery_method)
+      ivar = :@premailer_inliner
+      delivery_method.remove_instance_variable(ivar) if delivery_method.instance_variable_defined?(ivar)
+    end
   end
 end
